@@ -284,10 +284,14 @@ def handle_mcp_request(body: bytes, api_key: str | None) -> JsonRpcResponse:
             result = _handle_tools_list()
         elif rpc_req.method == "tools/call":
             if not rpc_req.params:
-                return _err(rpc_req.id, _INVALID_PARAMS, "Missing params for tools/call")
+                return _err(
+                    rpc_req.id, _INVALID_PARAMS, "Missing params for tools/call"
+                )
             result = _handle_tools_call(rpc_req.params)
         else:
-            return _err(rpc_req.id, _METHOD_NOT_FOUND, f"Method not found: {rpc_req.method}")
+            return _err(
+                rpc_req.id, _METHOD_NOT_FOUND, f"Method not found: {rpc_req.method}"
+            )
     except (ValidationError, TypeError) as exc:
         return _err(rpc_req.id, _INVALID_PARAMS, f"Invalid parameters: {exc}")
     except ValueError as exc:

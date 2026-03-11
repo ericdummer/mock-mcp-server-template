@@ -51,5 +51,7 @@ if __name__ == "__main__":
     )
     settings = get_settings()
     server = create_server(settings.host, settings.port)
-    logger.info("MCP server listening on http://%s:%s/mcp", settings.host, settings.port)
+    logger.info(
+        "MCP server listening on http://%s:%s/mcp", settings.host, settings.port
+    )
     server.serve_forever()
