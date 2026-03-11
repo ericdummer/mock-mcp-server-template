@@ -1,0 +1,20 @@
+{
+    "python.testing.pytestArgs": [
+        "tests"
+    ],
+    "python.testing.unittestEnabled": false,
+    "python.testing.pytestEnabled": true,
+    "sonarlint.connectedMode.project": {
+        "connectionId": "ericdummer",
+        "projectKey": "ericdummer_vibe-coded-protected"
+    },
+    "chat.tools.terminal.autoApprove": {
+        "command": true,
+        "java": true,
+        "/^command -v node && node -v && command -v npm && npm -v$/": {
+            "approve": true,
+            "matchCommandLine": true
+        },
+        "ruff": true
+    }
+}

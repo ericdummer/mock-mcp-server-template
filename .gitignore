@@ -1,0 +1,80 @@
+# Python
+__pycache__/
+*.py[codz]
+*$py.class
+*.so
+
+# Build and packaging
+.Python
+build/
+dist/
+.eggs/
+*.egg-info/
+*.egg
+MANIFEST
+
+# Test and coverage artifacts
+.coverage
+.coverage.*
+.hypothesis/
+.nox/
+.pytest_cache/
+.tox/
+coverage.xml
+cover/
+htmlcov/
+nosetests.xml
+
+# Type checker and linter caches
+.mypy_cache/
+.pyre/
+.pytype/
+.ruff_cache/
+
+# Virtual environments and local env files
+.env*
+!.env.example
+.envrc
+.direnv/
+.venv/
+env/
+venv/
+ENV/
+env.bak/
+venv.bak/
+
+# Local Python tool state
+.ipynb_checkpoints
+.pdm-build/
+.pdm-python
+.pixi
+__pypackages__/
+
+# Docker
+docker-compose.override.yml
+
+# Databases
+*.db
+*.sqlite
+*.sqlite3
+postgres_data/
+
+# IDEs and editors
+/.vscode/*
+!/.vscode/settings.json
+!/.vscode/launch.json
+!/.vscode/extensions.json
+.idea/
+.cursorignore
+.cursorindexingignore
+
+# OS and editor temp files
+.DS_Store
+Thumbs.db
+*.log
+*.swp
+*.swo
+
+# Local GitHub Actions secrets for act
+.secrets
+.act-secrets
