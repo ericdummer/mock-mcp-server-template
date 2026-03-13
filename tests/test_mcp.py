@@ -43,11 +43,24 @@ def test_mcp_without_api_key_returns_401():
 # ---------------------------------------------------------------------------
 
 _EXPECTED_TOOLS = {
-    "create_customer", "update_customer", "delete_customer", "get_customer", "list_customers",
-    "create_product", "update_product", "delete_product", "get_product", "list_products",
-    "create_order", "update_order_status", "add_products_to_order",
-    "remove_products_from_order", "delete_order", "get_order",
-    "list_orders", "list_orders_by_customer",
+    "create_customer",
+    "update_customer",
+    "delete_customer",
+    "get_customer",
+    "list_customers",
+    "create_product",
+    "update_product",
+    "delete_product",
+    "get_product",
+    "list_products",
+    "create_order",
+    "update_order_status",
+    "add_products_to_order",
+    "remove_products_from_order",
+    "delete_order",
+    "get_order",
+    "list_orders",
+    "list_orders_by_customer",
 }
 
 
@@ -124,7 +137,11 @@ async def test_create_customer_invalid_email(mcp_session: ClientSession):
 async def test_create_customer_appears_in_list(mcp_session: ClientSession):
     await mcp_session.call_tool(
         "create_customer",
-        {"name": "Unique Customer XYZ", "email": "unique@example.com", "phone": "555-9999"},
+        {
+            "name": "Unique Customer XYZ",
+            "email": "unique@example.com",
+            "phone": "555-9999",
+        },
     )
     result = await mcp_session.call_tool("list_customers", {})
     names = [c["name"] for c in json.loads(result.content[0].text)]
@@ -202,7 +219,12 @@ async def test_get_product_not_found(mcp_session: ClientSession):
 async def test_create_product_success(mcp_session: ClientSession):
     result = await mcp_session.call_tool(
         "create_product",
-        {"name": "Test Gadget", "description": "A test gadget.", "price": 9.99, "stock": 5},
+        {
+            "name": "Test Gadget",
+            "description": "A test gadget.",
+            "price": 9.99,
+            "stock": 5,
+        },
     )
     assert not result.isError
     p = json.loads(result.content[0].text)
@@ -234,7 +256,12 @@ async def test_delete_product_referenced_in_order_fails(mcp_session: ClientSessi
 async def test_delete_product_not_in_order_succeeds(mcp_session: ClientSession):
     created = await mcp_session.call_tool(
         "create_product",
-        {"name": "Deletable", "description": "Safe to delete.", "price": 1.0, "stock": 0},
+        {
+            "name": "Deletable",
+            "description": "Safe to delete.",
+            "price": 1.0,
+            "stock": 0,
+        },
     )
     pid = json.loads(created.content[0].text)["id"]
     result = await mcp_session.call_tool("delete_product", {"id": pid})
@@ -458,5 +485,3 @@ async def test_read_resource_order_products(mcp_session: ClientSession):
     assert isinstance(products, list)
     assert len(products) >= 1
     assert all("price" in p for p in products)
-
-

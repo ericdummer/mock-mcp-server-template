@@ -27,7 +27,10 @@ TOOL_DEFINITIONS: list[dict] = [
             "type": "object",
             "required": ["customer_id", "product_ids"],
             "properties": {
-                "customer_id": {"type": "string", "description": "ID of the customer placing the order."},
+                "customer_id": {
+                    "type": "string",
+                    "description": "ID of the customer placing the order.",
+                },
                 "product_ids": {
                     "type": "array",
                     "items": {"type": "string"},
@@ -46,7 +49,13 @@ TOOL_DEFINITIONS: list[dict] = [
                 "id": {"type": "string", "description": "Order ID."},
                 "status": {
                     "type": "string",
-                    "enum": ["pending", "confirmed", "shipped", "delivered", "cancelled"],
+                    "enum": [
+                        "pending",
+                        "confirmed",
+                        "shipped",
+                        "delivered",
+                        "cancelled",
+                    ],
                     "description": "New status.",
                 },
             },

@@ -60,9 +60,7 @@ def read(uri: str) -> str:
         cid = m.group(1)
         if cid not in store.customers:
             return json.dumps({"error": "Not found"})
-        result = [
-            o.to_dict() for o in store.orders.values() if o.customer_id == cid
-        ]
+        result = [o.to_dict() for o in store.orders.values() if o.customer_id == cid]
         return json.dumps(result, indent=2)
 
     # customers://{id}

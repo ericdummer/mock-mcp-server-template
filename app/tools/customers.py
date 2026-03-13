@@ -23,7 +23,10 @@ TOOL_DEFINITIONS: list[dict] = [
             "required": ["name", "email", "phone"],
             "properties": {
                 "name": {"type": "string", "description": "Full name of the customer."},
-                "email": {"type": "string", "description": "Email address (must contain @)."},
+                "email": {
+                    "type": "string",
+                    "description": "Email address (must contain @).",
+                },
                 "phone": {"type": "string", "description": "Phone number."},
             },
         },

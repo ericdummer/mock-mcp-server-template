@@ -23,9 +23,18 @@ TOOL_DEFINITIONS: list[dict] = [
             "required": ["name", "description", "price", "stock"],
             "properties": {
                 "name": {"type": "string", "description": "Product name."},
-                "description": {"type": "string", "description": "Product description."},
-                "price": {"type": "number", "description": "Unit price (non-negative)."},
-                "stock": {"type": "integer", "description": "Stock quantity (non-negative)."},
+                "description": {
+                    "type": "string",
+                    "description": "Product description.",
+                },
+                "price": {
+                    "type": "number",
+                    "description": "Unit price (non-negative).",
+                },
+                "stock": {
+                    "type": "integer",
+                    "description": "Stock quantity (non-negative).",
+                },
             },
         },
     },

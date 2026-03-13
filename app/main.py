@@ -123,5 +123,3 @@ if __name__ == "__main__":
     uvicorn.run(
         app, host=settings.host, port=settings.port, log_level=log_level.lower()
     )
-
-
