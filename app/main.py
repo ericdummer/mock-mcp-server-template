@@ -1,57 +1,127 @@
 """Mock MCP server entry point.
 
-Starts a plain HTTP server exposing the JSON-RPC 2.0 MCP endpoint at POST /mcp.
+Exposes the MCP protocol over HTTP using the official MCP SDK Streamable HTTP transport:
+  POST /mcp  — send MCP JSON-RPC messages; responses may be streamed via SSE
+  GET  /mcp  — open a long-lived SSE stream for server-initiated messages
+
+Authentication: every request to /mcp must include the configured API key header
+(default: X-Api-Key). Missing key → HTTP 401.
 """
 
 from __future__ import annotations
 
 import logging
-from http.server import BaseHTTPRequestHandler, HTTPServer
+from contextlib import asynccontextmanager
+from typing import AsyncIterator
 
-from app.api.mcp import handle_mcp_request
+from mcp.server.streamable_http_manager import StreamableHTTPSessionManager
+from starlette.applications import Starlette
+from starlette.datastructures import Headers
+from starlette.middleware import Middleware
+from starlette.middleware.cors import CORSMiddleware
+from starlette.responses import Response
+from starlette.routing import Route
+from starlette.types import Receive, Scope, Send
+
+from app.api.mcp import server  # noqa: F401 — registers list_tools/call_tool
 from app.core.config import get_settings
 
 logger = logging.getLogger(__name__)
 
 
-class MCPRequestHandler(BaseHTTPRequestHandler):
-    """HTTP request handler for the MCP server."""
+class MCPASGIEndpoint:
+    """ASGI endpoint wrapper so StreamableHTTP can own response writes."""
 
-    def do_POST(self) -> None:
-        if self.path == "/mcp":
-            content_length = int(self.headers.get("Content-Length", 0))
-            body = self.rfile.read(content_length) if content_length > 0 else b""
-            api_key = self.headers.get("X-Goog-Api-Key")
-            response = handle_mcp_request(body, api_key)
-            response_bytes = response.model_dump_json().encode()
-            self.send_response(200)
-            self.send_header("Content-Type", "application/json")
-            self.send_header("Content-Length", str(len(response_bytes)))
-            self.end_headers()
-            self.wfile.write(response_bytes)
-        else:
-            self.send_response(404)
-            self.end_headers()
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope["type"] != "http":
+            return
 
-    def log_message(self, format: str, *args: object) -> None:  # noqa: A002
-        logger.debug(format, *args)
+        settings = get_settings()
+        headers = Headers(scope=scope)
+        api_key = headers.get(settings.api_key_header)
+        if not api_key:
+            logger.warning(
+                "auth: missing %s header from %s",
+                settings.api_key_header,
+                scope.get("client"),
+            )
+            await Response(
+                f"Missing {settings.api_key_header} header",
+                status_code=401,
+                media_type="text/plain",
+            )(scope, receive, send)
+            return
+
+        logger.debug(
+            "MCP request from %s (%s)",
+            scope.get("client"),
+            scope.get("method"),
+        )
+        session_manager: StreamableHTTPSessionManager = scope[
+            "app"
+        ].state.session_manager
+        await session_manager.handle_request(scope, receive, send)
 
 
-def create_server(host: str = "0.0.0.0", port: int = 8000) -> HTTPServer:
-    """Create and return the HTTP server (does not start it)."""
-    return HTTPServer((host, port), MCPRequestHandler)
+mcp_endpoint = MCPASGIEndpoint()
+
+
+@asynccontextmanager
+async def lifespan(app: Starlette) -> AsyncIterator[None]:
+    """Create and run the session manager for the lifetime of the app."""
+    session_manager = StreamableHTTPSessionManager(app=server)
+    app.state.session_manager = session_manager
+    async with session_manager.run():
+        logger.info("MCP Streamable HTTP session manager started")
+        yield
+    logger.info("MCP Streamable HTTP session manager stopped")
+
+
+app = Starlette(
+    lifespan=lifespan,
+    routes=[
+        Route("/mcp", endpoint=mcp_endpoint, methods=["GET", "POST", "DELETE"]),
+    ],
+    middleware=[
+        Middleware(
+            CORSMiddleware,
+            allow_origins=["*"],
+            allow_methods=["GET", "POST", "DELETE", "OPTIONS"],
+            allow_headers=["*"],
+            expose_headers=["*"],
+        )
+    ],
+)
 
 
 if __name__ == "__main__":
     import logging as _logging
 
-    _logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s %(levelname)s %(message)s",
-    )
+    import uvicorn
+
     settings = get_settings()
-    server = create_server(settings.host, settings.port)
-    logger.info(
-        "MCP server listening on http://%s:%s/mcp", settings.host, settings.port
+
+    log_level = settings.log_level.upper()
+    numeric_level = getattr(_logging, log_level, None)
+    if not isinstance(numeric_level, int):
+        numeric_level = _logging.INFO
+        print(f"Warning: invalid LOG_LEVEL '{settings.log_level}', defaulting to INFO")
+
+    _logging.basicConfig(
+        level=numeric_level,
+        format="%(asctime)s %(levelname)s %(name)s %(message)s",
     )
-    server.serve_forever()
+
+    logger.info(
+        "Starting %s on http://%s:%s",
+        settings.app_name,
+        settings.host,
+        settings.port,
+    )
+    logger.debug("Settings: %s", settings.model_dump())
+
+    uvicorn.run(
+        app, host=settings.host, port=settings.port, log_level=log_level.lower()
+    )
+
+

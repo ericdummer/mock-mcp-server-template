@@ -20,6 +20,8 @@ def test_settings_defaults() -> None:
     assert settings.debug is False
     assert settings.host == "0.0.0.0"
     assert settings.port == 8000
+    assert settings.api_key_header == "X-Api-Key"
+    assert settings.log_level == "INFO"
 
 
 def test_settings_loads_from_environment(monkeypatch: pytest.MonkeyPatch) -> None:

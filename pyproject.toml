@@ -11,4 +11,8 @@ addopts = [
 markers = [
     "slow: marks tests as slow (deselect with '-m \"not slow\"')",
     "integration: marks tests as integration tests",
+    "anyio: marks tests as async (anyio backend)",
 ]
+
+[tool.anyio]
+anyio_mode = "auto"

@@ -1,473 +1,462 @@
 """
-Tests for the mock Google Maps Grounding Lite MCP server.
+Tests for the mock MCP server — Customers, Products, and Orders.
+
+Uses an in-memory MCP transport (no HTTP) via the mcp_session fixture in conftest.py.
 
 Covers:
-- tools/list
-- tools/call for search_places, lookup_weather (current, hourly, daily), compute_routes
-- Error cases: missing auth, unknown method, unknown tool, missing required params
+- tools/list: all 18 entity tools present, each has required fields
+- Customer CRUD: create, get, update, delete, validation
+- Product CRUD: create, get, update, delete, validation
+- Order CRUD: create, update_status, add/remove products, delete, validation
+- Resource reads: list_resources, list_resource_templates, read_resource
+- Auth check at the HTTP level (POST /mcp without key → 401)
 """
 
 from __future__ import annotations
 
+import json
 
-API_KEY = "test-api-key"
-MCP_URL = "/mcp"
-HEADERS_JSON = {"Content-Type": "application/json"}
-HEADERS_AUTH = {**HEADERS_JSON, "X-Goog-Api-Key": API_KEY}
+import pytest
 
-
-def _rpc(method: str, params: dict | None = None, rpc_id: int = 1) -> dict:
-    body: dict = {"jsonrpc": "2.0", "method": method, "id": rpc_id}
-    if params is not None:
-        body["params"] = params
-    return body
+from mcp import ClientSession
 
 
 # ---------------------------------------------------------------------------
-# Authentication
+# Authentication (HTTP-level, starlette TestClient)
 # ---------------------------------------------------------------------------
 
 
-def test_missing_api_key_returns_error(client):
-    """Missing X-Goog-Api-Key should return a JSON-RPC error (not HTTP 401)."""
-    response = client.post(MCP_URL, json=_rpc("tools/list"), headers=HEADERS_JSON)
-    assert response.status_code == 200
-    data = response.json()
-    assert data["error"] is not None
-    assert data["error"]["code"] == -32000
-    assert "X-Goog-Api-Key" in data["error"]["message"]
+def test_mcp_without_api_key_returns_401():
+    """POST /mcp without the API key header should return HTTP 401."""
+    from starlette.testclient import TestClient
 
+    from app.main import app
 
-def test_empty_api_key_returns_error(client):
-    """Empty X-Goog-Api-Key should be treated as missing."""
-    response = client.post(
-        MCP_URL,
-        json=_rpc("tools/list"),
-        headers={**HEADERS_JSON, "X-Goog-Api-Key": ""},
-    )
-    assert response.status_code == 200
-    data = response.json()
-    assert data["error"] is not None
-    assert data["error"]["code"] == -32000
-    assert "X-Goog-Api-Key" in data["error"]["message"]
+    with TestClient(app, raise_server_exceptions=False) as client:
+        response = client.post("/mcp")
+    assert response.status_code == 401
+    assert "X-Api-Key" in response.text
 
 
 # ---------------------------------------------------------------------------
 # tools/list
 # ---------------------------------------------------------------------------
 
-
-def test_tools_list_returns_three_tools(client):
-    """tools/list should return exactly the 3 Grounding Lite tools."""
-    response = client.post(MCP_URL, json=_rpc("tools/list"), headers=HEADERS_AUTH)
-    assert response.status_code == 200
-    data = response.json()
-    assert data["error"] is None
-    tools = data["result"]["tools"]
-    assert len(tools) == 3
-    names = {t["name"] for t in tools}
-    assert names == {"search_places", "lookup_weather", "compute_routes"}
+_EXPECTED_TOOLS = {
+    "create_customer", "update_customer", "delete_customer", "get_customer", "list_customers",
+    "create_product", "update_product", "delete_product", "get_product", "list_products",
+    "create_order", "update_order_status", "add_products_to_order",
+    "remove_products_from_order", "delete_order", "get_order",
+    "list_orders", "list_orders_by_customer",
+}
 
 
-def test_tools_list_tool_has_required_fields(client):
-    """Each tool definition must have name, description, and inputSchema."""
-    response = client.post(MCP_URL, json=_rpc("tools/list"), headers=HEADERS_AUTH)
-    tools = response.json()["result"]["tools"]
-    for tool in tools:
-        assert "name" in tool
-        assert "description" in tool
-        assert "inputSchema" in tool
-        assert tool["inputSchema"]["type"] == "object"
+@pytest.mark.anyio
+async def test_tools_list_includes_all_entity_tools(mcp_session: ClientSession):
+    result = await mcp_session.list_tools()
+    names = {t.name for t in result.tools}
+    assert _EXPECTED_TOOLS <= names
 
 
-# ---------------------------------------------------------------------------
-# tools/call — search_places
-# ---------------------------------------------------------------------------
-
-
-def test_search_places_basic(client):
-    """search_places with a text_query should return places and a summary."""
-    response = client.post(
-        MCP_URL,
-        json=_rpc(
-            "tools/call",
-            {
-                "name": "search_places",
-                "arguments": {"textQuery": "coffee shops in New York"},
-            },
-        ),
-        headers=HEADERS_AUTH,
-    )
-    assert response.status_code == 200
-    data = response.json()
-    assert data["error"] is None
-    result = data["result"]["result"]
-    assert "places" in result
-    assert "summary" in result
-    assert len(result["places"]) > 0
-    assert "coffee" in result["summary"].lower()
-
-
-def test_search_places_with_location_bias(client):
-    """search_places with locationBias should still return valid places."""
-    response = client.post(
-        MCP_URL,
-        json=_rpc(
-            "tools/call",
-            {
-                "name": "search_places",
-                "arguments": {
-                    "textQuery": "pizza restaurants",
-                    "locationBias": {
-                        "circle": {
-                            "center": {"latitude": 40.7128, "longitude": -74.0060},
-                            "radiusMeters": 5000,
-                        }
-                    },
-                },
-            },
-        ),
-        headers=HEADERS_AUTH,
-    )
-    assert response.status_code == 200
-    data = response.json()
-    assert data["error"] is None
-    places = data["result"]["result"]["places"]
-    assert len(places) > 0
-    # Coordinates should be near New York
-    for place in places:
-        assert "location" in place
-        assert abs(place["location"]["latitude"] - 40.7128) < 1.0
-
-
-def test_search_places_place_has_maps_links(client):
-    """Each place should have googleMapsLinks with required URLs."""
-    response = client.post(
-        MCP_URL,
-        json=_rpc(
-            "tools/call",
-            {"name": "search_places", "arguments": {"textQuery": "parks in Chicago"}},
-        ),
-        headers=HEADERS_AUTH,
-    )
-    places = response.json()["result"]["result"]["places"]
-    for place in places:
-        links = place["googleMapsLinks"]
-        assert "placeUrl" in links
-        assert "directionsUrl" in links
-
-
-def test_search_places_missing_text_query_returns_error(client):
-    """search_places without textQuery should return an invalid-params error."""
-    response = client.post(
-        MCP_URL,
-        json=_rpc("tools/call", {"name": "search_places", "arguments": {}}),
-        headers=HEADERS_AUTH,
-    )
-    data = response.json()
-    assert data["error"] is not None
-    assert data["error"]["code"] == -32602
+@pytest.mark.anyio
+async def test_tools_list_each_tool_has_required_fields(mcp_session: ClientSession):
+    result = await mcp_session.list_tools()
+    for tool in result.tools:
+        assert tool.name
+        assert tool.description
+        assert tool.inputSchema is not None
 
 
 # ---------------------------------------------------------------------------
-# tools/call — lookup_weather
+# Customer tools
 # ---------------------------------------------------------------------------
 
 
-def test_lookup_weather_current_by_address(client):
-    """lookup_weather with address only should return current conditions."""
-    response = client.post(
-        MCP_URL,
-        json=_rpc(
-            "tools/call",
-            {
-                "name": "lookup_weather",
-                "arguments": {"location": {"address": "London, UK"}},
-            },
-        ),
-        headers=HEADERS_AUTH,
+@pytest.mark.anyio
+async def test_list_customers_returns_seed_data(mcp_session: ClientSession):
+    result = await mcp_session.call_tool("list_customers", {})
+    assert not result.isError
+    customers = json.loads(result.content[0].text)
+    assert len(customers) >= 3
+    ids = {c["id"] for c in customers}
+    assert "cust-001" in ids
+
+
+@pytest.mark.anyio
+async def test_get_customer_returns_correct_record(mcp_session: ClientSession):
+    result = await mcp_session.call_tool("get_customer", {"id": "cust-001"})
+    assert not result.isError
+    c = json.loads(result.content[0].text)
+    assert c["id"] == "cust-001"
+    assert c["name"] == "Alice Johnson"
+
+
+@pytest.mark.anyio
+async def test_get_customer_not_found(mcp_session: ClientSession):
+    result = await mcp_session.call_tool("get_customer", {"id": "cust-9999"})
+    assert result.isError
+    assert "not found" in result.content[0].text.lower()
+
+
+@pytest.mark.anyio
+async def test_create_customer_success(mcp_session: ClientSession):
+    result = await mcp_session.call_tool(
+        "create_customer",
+        {"name": "Dana Lee", "email": "dana@example.com", "phone": "555-2001"},
     )
-    assert response.status_code == 200
-    data = response.json()
-    assert data["error"] is None
-    result = data["result"]["result"]
-    assert "currentConditions" in result
-    assert "temperature" in result["currentConditions"]
-    assert result["geocodedAddress"] == "London, UK"
+    assert not result.isError
+    c = json.loads(result.content[0].text)
+    assert c["name"] == "Dana Lee"
+    assert "id" in c
 
 
-def test_lookup_weather_imperial_units(client):
-    """lookup_weather with IMPERIAL units should return FAHRENHEIT."""
-    response = client.post(
-        MCP_URL,
-        json=_rpc(
-            "tools/call",
-            {
-                "name": "lookup_weather",
-                "arguments": {
-                    "location": {"address": "New York, USA"},
-                    "unitsSystem": "IMPERIAL",
-                },
-            },
-        ),
-        headers=HEADERS_AUTH,
+@pytest.mark.anyio
+async def test_create_customer_invalid_email(mcp_session: ClientSession):
+    result = await mcp_session.call_tool(
+        "create_customer",
+        {"name": "Bad Email", "email": "notanemail", "phone": "555-0000"},
     )
-    result = response.json()["result"]["result"]
-    assert result["currentConditions"]["temperature"]["unit"] == "FAHRENHEIT"
+    assert result.isError
+    assert "@" in result.content[0].text or "email" in result.content[0].text.lower()
 
 
-def test_lookup_weather_daily_forecast(client):
-    """lookup_weather with date but no hour should return daily forecast."""
-    response = client.post(
-        MCP_URL,
-        json=_rpc(
-            "tools/call",
-            {
-                "name": "lookup_weather",
-                "arguments": {
-                    "location": {"address": "Paris, France"},
-                    "date": {"year": 2026, "month": 6, "day": 15},
-                },
-            },
-        ),
-        headers=HEADERS_AUTH,
+@pytest.mark.anyio
+async def test_create_customer_appears_in_list(mcp_session: ClientSession):
+    await mcp_session.call_tool(
+        "create_customer",
+        {"name": "Unique Customer XYZ", "email": "unique@example.com", "phone": "555-9999"},
     )
-    result = response.json()["result"]["result"]
-    assert "dailyForecast" in result
-    assert len(result["dailyForecast"]) == 7
+    result = await mcp_session.call_tool("list_customers", {})
+    names = [c["name"] for c in json.loads(result.content[0].text)]
+    assert "Unique Customer XYZ" in names
 
 
-def test_lookup_weather_hourly_forecast(client):
-    """lookup_weather with date and hour should return hourly forecast."""
-    response = client.post(
-        MCP_URL,
-        json=_rpc(
-            "tools/call",
-            {
-                "name": "lookup_weather",
-                "arguments": {
-                    "location": {"address": "Tokyo, Japan"},
-                    "date": {"year": 2026, "month": 3, "day": 10},
-                    "hour": 14,
-                },
-            },
-        ),
-        headers=HEADERS_AUTH,
+@pytest.mark.anyio
+async def test_update_customer_changes_fields(mcp_session: ClientSession):
+    created = await mcp_session.call_tool(
+        "create_customer",
+        {"name": "Temp Customer", "email": "temp@example.com", "phone": "555-1111"},
     )
-    result = response.json()["result"]["result"]
-    assert "hourlyForecast" in result
-    assert result["hourlyForecast"][0]["hour"] == 14
-
-
-def test_lookup_weather_by_lat_lng(client):
-    """lookup_weather with latLng should geocode and return conditions."""
-    response = client.post(
-        MCP_URL,
-        json=_rpc(
-            "tools/call",
-            {
-                "name": "lookup_weather",
-                "arguments": {
-                    "location": {"latLng": {"latitude": 48.8566, "longitude": 2.3522}}
-                },
-            },
-        ),
-        headers=HEADERS_AUTH,
+    cid = json.loads(created.content[0].text)["id"]
+    updated = await mcp_session.call_tool(
+        "update_customer", {"id": cid, "name": "Updated Name", "phone": "555-2222"}
     )
-    result = response.json()["result"]["result"]
-    assert "currentConditions" in result
-    assert "48.8566" in result["geocodedAddress"]
+    assert not updated.isError
+    c = json.loads(updated.content[0].text)
+    assert c["name"] == "Updated Name"
+    assert c["phone"] == "555-2222"
 
 
-def test_lookup_weather_missing_location_returns_error(client):
-    """lookup_weather without location should return invalid-params error."""
-    response = client.post(
-        MCP_URL,
-        json=_rpc("tools/call", {"name": "lookup_weather", "arguments": {}}),
-        headers=HEADERS_AUTH,
+@pytest.mark.anyio
+async def test_delete_customer_with_orders_fails(mcp_session: ClientSession):
+    # cust-001 has seed orders; deletion must be rejected
+    result = await mcp_session.call_tool("delete_customer", {"id": "cust-001"})
+    assert result.isError
+    assert "order" in result.content[0].text.lower()
+
+
+@pytest.mark.anyio
+async def test_delete_customer_without_orders_succeeds(mcp_session: ClientSession):
+    created = await mcp_session.call_tool(
+        "create_customer",
+        {"name": "No Orders", "email": "noorders@example.com", "phone": "555-4444"},
     )
-    data = response.json()
-    assert data["error"] is not None
-    assert data["error"]["code"] == -32602
+    cid = json.loads(created.content[0].text)["id"]
+    result = await mcp_session.call_tool("delete_customer", {"id": cid})
+    assert not result.isError
+    check = await mcp_session.call_tool("get_customer", {"id": cid})
+    assert check.isError
 
 
 # ---------------------------------------------------------------------------
-# tools/call — compute_routes
+# Product tools
 # ---------------------------------------------------------------------------
 
 
-def test_compute_routes_drive(client):
-    """compute_routes with DRIVE mode should return distance and duration."""
-    response = client.post(
-        MCP_URL,
-        json=_rpc(
-            "tools/call",
-            {
-                "name": "compute_routes",
-                "arguments": {
-                    "origin": {"address": "Eiffel Tower, Paris"},
-                    "destination": {"address": "Louvre Museum, Paris"},
-                    "travelMode": "DRIVE",
-                },
-            },
-        ),
-        headers=HEADERS_AUTH,
+@pytest.mark.anyio
+async def test_list_products_returns_seed_data(mcp_session: ClientSession):
+    result = await mcp_session.call_tool("list_products", {})
+    assert not result.isError
+    products = json.loads(result.content[0].text)
+    assert len(products) >= 5
+    ids = {p["id"] for p in products}
+    assert "prod-001" in ids
+
+
+@pytest.mark.anyio
+async def test_get_product_returns_correct_record(mcp_session: ClientSession):
+    result = await mcp_session.call_tool("get_product", {"id": "prod-002"})
+    assert not result.isError
+    p = json.loads(result.content[0].text)
+    assert p["id"] == "prod-002"
+    assert p["name"] == "Wireless Mouse"
+
+
+@pytest.mark.anyio
+async def test_get_product_not_found(mcp_session: ClientSession):
+    result = await mcp_session.call_tool("get_product", {"id": "prod-9999"})
+    assert result.isError
+
+
+@pytest.mark.anyio
+async def test_create_product_success(mcp_session: ClientSession):
+    result = await mcp_session.call_tool(
+        "create_product",
+        {"name": "Test Gadget", "description": "A test gadget.", "price": 9.99, "stock": 5},
     )
-    assert response.status_code == 200
-    data = response.json()
-    assert data["error"] is None
-    routes = data["result"]["result"]["routes"]
-    assert len(routes) == 1
-    assert routes[0]["distanceMeters"] > 0
-    assert "seconds" in routes[0]["duration"]
+    assert not result.isError
+    p = json.loads(result.content[0].text)
+    assert p["name"] == "Test Gadget"
+    assert p["price"] == 9.99
 
 
-def test_compute_routes_walk(client):
-    """compute_routes with WALK mode should return a shorter route than DRIVE."""
-    walk_response = client.post(
-        MCP_URL,
-        json=_rpc(
-            "tools/call",
-            {
-                "name": "compute_routes",
-                "arguments": {
-                    "origin": {"address": "Central Park, New York"},
-                    "destination": {"placeId": "ChIJOwE_Id1w5EAR4Q27FkL6T_0"},
-                    "travelMode": "WALK",
-                },
-            },
-        ),
-        headers=HEADERS_AUTH,
+@pytest.mark.anyio
+async def test_update_product_changes_price(mcp_session: ClientSession):
+    created = await mcp_session.call_tool(
+        "create_product",
+        {"name": "Price Test", "description": ".", "price": 10.0, "stock": 1},
     )
-    drive_response = client.post(
-        MCP_URL,
-        json=_rpc(
-            "tools/call",
-            {
-                "name": "compute_routes",
-                "arguments": {
-                    "origin": {"address": "Central Park, New York"},
-                    "destination": {"placeId": "ChIJOwE_Id1w5EAR4Q27FkL6T_0"},
-                    "travelMode": "DRIVE",
-                },
-            },
-        ),
-        headers=HEADERS_AUTH,
+    pid = json.loads(created.content[0].text)["id"]
+    updated = await mcp_session.call_tool("update_product", {"id": pid, "price": 19.99})
+    assert not updated.isError
+    assert json.loads(updated.content[0].text)["price"] == 19.99
+
+
+@pytest.mark.anyio
+async def test_delete_product_referenced_in_order_fails(mcp_session: ClientSession):
+    # prod-001 is in order-001; deletion must be rejected
+    result = await mcp_session.call_tool("delete_product", {"id": "prod-001"})
+    assert result.isError
+    assert "order" in result.content[0].text.lower()
+
+
+@pytest.mark.anyio
+async def test_delete_product_not_in_order_succeeds(mcp_session: ClientSession):
+    created = await mcp_session.call_tool(
+        "create_product",
+        {"name": "Deletable", "description": "Safe to delete.", "price": 1.0, "stock": 0},
     )
-    walk_routes = walk_response.json()["result"]["result"]["routes"]
-    drive_routes = drive_response.json()["result"]["result"]["routes"]
-    assert walk_routes[0]["distanceMeters"] < drive_routes[0]["distanceMeters"]
-
-
-def test_compute_routes_by_lat_lng(client):
-    """compute_routes with latLng waypoints should succeed."""
-    response = client.post(
-        MCP_URL,
-        json=_rpc(
-            "tools/call",
-            {
-                "name": "compute_routes",
-                "arguments": {
-                    "origin": {"latLng": {"latitude": 37.7749, "longitude": -122.4194}},
-                    "destination": {
-                        "latLng": {"latitude": 37.3382, "longitude": -121.8863}
-                    },
-                },
-            },
-        ),
-        headers=HEADERS_AUTH,
-    )
-    data = response.json()
-    assert data["error"] is None
-    assert len(data["result"]["result"]["routes"]) == 1
-
-
-def test_compute_routes_missing_destination_returns_error(client):
-    """compute_routes without destination should return invalid-params error."""
-    response = client.post(
-        MCP_URL,
-        json=_rpc(
-            "tools/call",
-            {
-                "name": "compute_routes",
-                "arguments": {"origin": {"address": "Somewhere"}},
-            },
-        ),
-        headers=HEADERS_AUTH,
-    )
-    data = response.json()
-    assert data["error"] is not None
-    assert data["error"]["code"] == -32602
+    pid = json.loads(created.content[0].text)["id"]
+    result = await mcp_session.call_tool("delete_product", {"id": pid})
+    assert not result.isError
+    check = await mcp_session.call_tool("get_product", {"id": pid})
+    assert check.isError
 
 
 # ---------------------------------------------------------------------------
-# Error handling
+# Order tools
 # ---------------------------------------------------------------------------
 
 
-def test_unknown_method_returns_method_not_found(client):
-    """Calling an unknown JSON-RPC method should return -32601."""
-    response = client.post(
-        MCP_URL,
-        json=_rpc("nonexistent/method"),
-        headers=HEADERS_AUTH,
+@pytest.mark.anyio
+async def test_list_orders_returns_seed_data(mcp_session: ClientSession):
+    result = await mcp_session.call_tool("list_orders", {})
+    assert not result.isError
+    orders = json.loads(result.content[0].text)
+    assert len(orders) >= 4
+
+
+@pytest.mark.anyio
+async def test_get_order_returns_correct_record(mcp_session: ClientSession):
+    result = await mcp_session.call_tool("get_order", {"id": "order-001"})
+    assert not result.isError
+    o = json.loads(result.content[0].text)
+    assert o["id"] == "order-001"
+    assert o["customer_id"] == "cust-001"
+
+
+@pytest.mark.anyio
+async def test_create_order_success(mcp_session: ClientSession):
+    result = await mcp_session.call_tool(
+        "create_order",
+        {"customer_id": "cust-002", "product_ids": ["prod-002", "prod-003"]},
     )
-    data = response.json()
-    assert data["error"]["code"] == -32601
+    assert not result.isError
+    o = json.loads(result.content[0].text)
+    assert o["customer_id"] == "cust-002"
+    assert o["status"] == "pending"
+    assert abs(o["total"] - (29.99 + 49.99)) < 0.01
 
 
-def test_invalid_jsonrpc_envelope_returns_invalid_request(client):
-    """A valid JSON body with an invalid JSON-RPC envelope should return -32600."""
-    response = client.post(
-        MCP_URL,
-        json={"jsonrpc": "1.0", "id": 1, "method": "tools/list"},
-        headers=HEADERS_AUTH,
+@pytest.mark.anyio
+async def test_create_order_invalid_customer(mcp_session: ClientSession):
+    result = await mcp_session.call_tool(
+        "create_order",
+        {"customer_id": "cust-9999", "product_ids": ["prod-001"]},
     )
-    data = response.json()
-    assert response.status_code == 200
-    assert data["error"] is not None
-    assert data["error"]["code"] == -32600
-    assert data["result"] is None
+    assert result.isError
+    assert "not found" in result.content[0].text.lower()
 
 
-def test_unknown_tool_returns_invalid_params(client):
-    """Calling tools/call with an unknown tool name should return -32602."""
-    response = client.post(
-        MCP_URL,
-        json=_rpc("tools/call", {"name": "nonexistent_tool", "arguments": {}}),
-        headers=HEADERS_AUTH,
+@pytest.mark.anyio
+async def test_create_order_invalid_product(mcp_session: ClientSession):
+    result = await mcp_session.call_tool(
+        "create_order",
+        {"customer_id": "cust-001", "product_ids": ["prod-9999"]},
     )
-    data = response.json()
-    assert data["error"]["code"] == -32602
+    assert result.isError
 
 
-def test_tools_call_without_params_returns_invalid_params(client):
-    """tools/call without a params block should return -32602."""
-    response = client.post(
-        MCP_URL,
-        json=_rpc("tools/call"),
-        headers=HEADERS_AUTH,
+@pytest.mark.anyio
+async def test_update_order_status_valid(mcp_session: ClientSession):
+    result = await mcp_session.call_tool(
+        "update_order_status", {"id": "order-003", "status": "shipped"}
     )
-    data = response.json()
-    assert data["error"]["code"] == -32602
+    assert not result.isError
+    assert json.loads(result.content[0].text)["status"] == "shipped"
 
 
-def test_invalid_json_body_returns_parse_error(client):
-    """Sending a non-JSON body should return a parse error."""
-    response = client.post(
-        MCP_URL,
-        content=b"not json at all!!!",
-        headers={**HEADERS_AUTH, "Content-Type": "application/json"},
+@pytest.mark.anyio
+async def test_update_order_status_invalid(mcp_session: ClientSession):
+    result = await mcp_session.call_tool(
+        "update_order_status", {"id": "order-003", "status": "in_transit"}
     )
-    data = response.json()
-    assert data["error"]["code"] == -32700
+    assert result.isError
 
 
-def test_jsonrpc_id_is_echoed_back(client):
-    """The JSON-RPC id in the request should be echoed in the response."""
-    response = client.post(
-        MCP_URL,
-        json=_rpc("tools/list", rpc_id=42),
-        headers=HEADERS_AUTH,
+@pytest.mark.anyio
+async def test_add_products_to_order(mcp_session: ClientSession):
+    # Create a fresh order then add a product to it
+    created = await mcp_session.call_tool(
+        "create_order",
+        {"customer_id": "cust-003", "product_ids": ["prod-002"]},
     )
-    assert response.json()["id"] == 42
+    oid = json.loads(created.content[0].text)["id"]
+    result = await mcp_session.call_tool(
+        "add_products_to_order", {"id": oid, "product_ids": ["prod-003"]}
+    )
+    assert not result.isError
+    o = json.loads(result.content[0].text)
+    assert "prod-003" in o["product_ids"]
+    assert abs(o["total"] - (29.99 + 49.99)) < 0.01
+
+
+@pytest.mark.anyio
+async def test_remove_products_from_order(mcp_session: ClientSession):
+    created = await mcp_session.call_tool(
+        "create_order",
+        {"customer_id": "cust-001", "product_ids": ["prod-002", "prod-003"]},
+    )
+    oid = json.loads(created.content[0].text)["id"]
+    result = await mcp_session.call_tool(
+        "remove_products_from_order", {"id": oid, "product_ids": ["prod-003"]}
+    )
+    assert not result.isError
+    o = json.loads(result.content[0].text)
+    assert "prod-003" not in o["product_ids"]
+    assert abs(o["total"] - 29.99) < 0.01
+
+
+@pytest.mark.anyio
+async def test_list_orders_by_customer(mcp_session: ClientSession):
+    result = await mcp_session.call_tool(
+        "list_orders_by_customer", {"customer_id": "cust-001"}
+    )
+    assert not result.isError
+    orders = json.loads(result.content[0].text)
+    assert len(orders) >= 2
+    for o in orders:
+        assert o["customer_id"] == "cust-001"
+
+
+@pytest.mark.anyio
+async def test_delete_order_succeeds(mcp_session: ClientSession):
+    created = await mcp_session.call_tool(
+        "create_order",
+        {"customer_id": "cust-002", "product_ids": ["prod-005"]},
+    )
+    oid = json.loads(created.content[0].text)["id"]
+    result = await mcp_session.call_tool("delete_order", {"id": oid})
+    assert not result.isError
+    check = await mcp_session.call_tool("get_order", {"id": oid})
+    assert check.isError
+
+
+# ---------------------------------------------------------------------------
+# Resource handlers
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.anyio
+async def test_list_resources_returns_concrete_resources(mcp_session: ClientSession):
+    result = await mcp_session.list_resources()
+    uris = {str(r.uri) for r in result.resources}
+    assert "customers://all" in uris
+    assert "products://all" in uris
+    assert "orders://all" in uris
+
+
+@pytest.mark.anyio
+async def test_list_resource_templates(mcp_session: ClientSession):
+    result = await mcp_session.list_resource_templates()
+    templates = {t.uriTemplate for t in result.resourceTemplates}
+    assert "customers://{id}" in templates
+    assert "customers://{id}/orders" in templates
+    assert "products://{id}" in templates
+    assert "orders://{id}" in templates
+    assert "orders://{id}/products" in templates
+
+
+@pytest.mark.anyio
+async def test_read_resource_customers_all(mcp_session: ClientSession):
+    result = await mcp_session.read_resource("customers://all")
+    data = json.loads(result.contents[0].text)
+    assert isinstance(data, list)
+    assert len(data) >= 3
+
+
+@pytest.mark.anyio
+async def test_read_resource_single_customer(mcp_session: ClientSession):
+    result = await mcp_session.read_resource("customers://cust-002")
+    data = json.loads(result.contents[0].text)
+    assert data["id"] == "cust-002"
+    assert data["name"] == "Bob Smith"
+
+
+@pytest.mark.anyio
+async def test_read_resource_customer_not_found(mcp_session: ClientSession):
+    result = await mcp_session.read_resource("customers://cust-9999")
+    data = json.loads(result.contents[0].text)
+    assert "error" in data
+
+
+@pytest.mark.anyio
+async def test_read_resource_customer_orders(mcp_session: ClientSession):
+    result = await mcp_session.read_resource("customers://cust-001/orders")
+    orders = json.loads(result.contents[0].text)
+    assert isinstance(orders, list)
+    assert len(orders) >= 2
+    for o in orders:
+        assert o["customer_id"] == "cust-001"
+
+
+@pytest.mark.anyio
+async def test_read_resource_products_all(mcp_session: ClientSession):
+    result = await mcp_session.read_resource("products://all")
+    data = json.loads(result.contents[0].text)
+    assert len(data) >= 5
+
+
+@pytest.mark.anyio
+async def test_read_resource_single_product(mcp_session: ClientSession):
+    result = await mcp_session.read_resource("products://prod-001")
+    data = json.loads(result.contents[0].text)
+    assert data["id"] == "prod-001"
+
+
+@pytest.mark.anyio
+async def test_read_resource_orders_all(mcp_session: ClientSession):
+    result = await mcp_session.read_resource("orders://all")
+    data = json.loads(result.contents[0].text)
+    assert len(data) >= 4
+
+
+@pytest.mark.anyio
+async def test_read_resource_order_products(mcp_session: ClientSession):
+    result = await mcp_session.read_resource("orders://order-001/products")
+    products = json.loads(result.contents[0].text)
+    assert isinstance(products, list)
+    assert len(products) >= 1
+    assert all("price" in p for p in products)
+
+

@@ -1,34 +1,21 @@
 """
 Test configuration and fixtures.
+
+Tests use an in-memory MCP transport so no HTTP server or network is needed.
+Each test gets a fresh ClientSession connected to the shared server instance.
 """
 
-import threading
+from __future__ import annotations
 
-import httpx
+from typing import AsyncGenerator
+
+import anyio
 import pytest
-from http.server import HTTPServer
 
-from app.main import MCPRequestHandler
+from mcp import ClientSession
+from mcp.shared.memory import create_client_server_memory_streams
 
-
-@pytest.fixture(scope="session")
-def server_url():
-    """Start the MCP HTTP server in a background thread and return its base URL."""
-    server = HTTPServer(("127.0.0.1", 0), MCPRequestHandler)
-    port = server.server_address[1]
-    thread = threading.Thread(target=server.serve_forever, daemon=True)
-    thread.start()
-    yield f"http://127.0.0.1:{port}"
-    server.shutdown()
-    server.server_close()
-    thread.join(timeout=2)
-
-
-@pytest.fixture
-def client(server_url):
-    """Return an httpx client pointed at the test server."""
-    with httpx.Client(base_url=server_url) as c:
-        yield c
+from app.api.mcp import server
 
 
 @pytest.fixture
@@ -37,3 +24,31 @@ def test_settings():
     from app.core.config import Settings
 
     return Settings(debug=True)
+
+
+@pytest.fixture(autouse=True)
+def _clear_settings_cache() -> None:
+    """Ensure get_settings() cache does not leak between tests."""
+    from app.core.config import get_settings
+
+    get_settings.cache_clear()
+
+
+@pytest.fixture
+async def mcp_session() -> AsyncGenerator[ClientSession, None]:
+    """Provide an in-memory MCP client session connected to the server."""
+    async with create_client_server_memory_streams() as (
+        client_streams,
+        server_streams,
+    ):
+        async with ClientSession(*client_streams) as session:
+            async with anyio.create_task_group() as tg:
+                tg.start_soon(
+                    server.run,
+                    server_streams[0],
+                    server_streams[1],
+                    server.create_initialization_options(),
+                )
+                await session.initialize()
+                yield session
+                tg.cancel_scope.cancel()

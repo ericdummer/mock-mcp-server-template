@@ -1,302 +1,168 @@
 """
-Mock Google Maps Grounding Lite MCP handler.
+MCP SDK tool and resource dispatcher.
 
-Implements the JSON-RPC 2.0 protocol, mirroring:
-https://developers.google.com/maps/ai/grounding-lite
+Registers handlers for tools and resources on the shared Server instance.
 
-Supported methods:
-- tools/list   — return the three available Grounding Lite tool definitions
-- tools/call   — dispatch to search_places, lookup_weather, or compute_routes
+Tools are organised by entity (customers, products, orders). Each entity module
+exposes TOOL_DEFINITIONS (list[dict]) and handle(name, params) -> dict.
+
+Resources are read-only and organised similarly, with get_resources(),
+get_templates(), and read(uri) functions per entity module.
+
+Logging uses two channels:
+- Python stdlib logging (server-side, visible in server logs)
+- send_log_message (MCP protocol, forwarded to the connected MCP client)
 """
 
 from __future__ import annotations
 
-import json
+import logging
+import time
 from typing import Any
 
-from pydantic import ValidationError
+from mcp.types import CallToolResult, Resource, ResourceTemplate, TextContent, Tool
 
-from app.api.mcp_mock_data import (
-    build_compute_routes_response,
-    build_lookup_weather_response,
-    build_search_places_response,
-)
-from app.models.mcp_models import (
-    ComputeRoutesRequest,
-    JsonRpcError,
-    JsonRpcRequest,
-    JsonRpcResponse,
-    LookupWeatherRequest,
-    SearchPlacesRequest,
-    ToolDefinition,
-    ToolsListResult,
-)
+from app.core.server import server
+from app.resources import customers as customers_res
+from app.resources import orders as orders_res
+from app.resources import products as products_res
+from app.tools import customers as customers_tools
+from app.tools import orders as orders_tools
+from app.tools import products as products_tools
+
+logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
-# Tool definitions (mirrors the real Grounding Lite tool list)
+# Tool registry — built once at import time from entity modules
 # ---------------------------------------------------------------------------
 
-_TOOLS: list[ToolDefinition] = [
-    ToolDefinition(
-        name="search_places",
-        description=(
-            "Call this tool when the user's request is to find places, businesses, "
-            "addresses, locations, points of interest, or any other Google Maps related search."
-        ),
-        inputSchema={
-            "type": "object",
-            "required": ["textQuery"],
-            "properties": {
-                "textQuery": {
-                    "type": "string",
-                    "description": "The primary search query.",
-                },
-                "languageCode": {
-                    "type": "string",
-                    "description": "ISO 639-1 language code for summary language.",
-                },
-                "regionCode": {
-                    "type": "string",
-                    "description": "ISO 3166-1 alpha-2 country code.",
-                },
-                "pageSize": {
-                    "type": "integer",
-                    "description": "Maximum number of places to return.",
-                },
-                "pageToken": {
-                    "type": "string",
-                    "description": "Page token from a previous call.",
-                },
-                "locationBias": {
-                    "type": "object",
-                    "description": "Optional circle to bias results.",
-                    "properties": {
-                        "circle": {
-                            "type": "object",
-                            "properties": {
-                                "center": {
-                                    "type": "object",
-                                    "properties": {
-                                        "latitude": {"type": "number"},
-                                        "longitude": {"type": "number"},
-                                    },
-                                    "required": ["latitude", "longitude"],
-                                },
-                                "radiusMeters": {"type": "number"},
-                            },
-                            "required": ["center"],
-                        }
-                    },
-                },
+# Maps tool name -> (entity_module, definition_dict)
+_TOOL_REGISTRY: dict[str, tuple] = {}
+for _entity_mod in [customers_tools, products_tools, orders_tools]:
+    for _defn in _entity_mod.TOOL_DEFINITIONS:
+        _TOOL_REGISTRY[_defn["name"]] = (_entity_mod, _defn)
+
+# ---------------------------------------------------------------------------
+# Tool handlers
+# ---------------------------------------------------------------------------
+
+
+@server.list_tools()
+async def list_tools() -> list[Tool]:
+    """Return all registered tool definitions."""
+    logger.debug("tools/list called (%d tools registered)", len(_TOOL_REGISTRY))
+    return [Tool(**defn) for _, defn in _TOOL_REGISTRY.values()]
+
+
+@server.call_tool()
+async def call_tool(name: str, arguments: dict[str, Any]) -> CallToolResult:
+    """Dispatch a tool call and log the outcome via the MCP protocol."""
+    ctx = server.request_context
+    session = ctx.session
+
+    if name not in _TOOL_REGISTRY:
+        msg = f"Unknown tool: {name}"
+        logger.warning("tools/call unknown tool=%s", name)
+        await session.send_log_message(
+            level="warning",
+            data={"tool": name, "status": "unknown_tool", "error": msg},
+            logger="mcp.tools",
+        )
+        return CallToolResult(
+            content=[TextContent(type="text", text=msg)],
+            isError=True,
+        )
+
+    await session.send_log_message(
+        level="debug",
+        data={"tool": name, "arguments": arguments},
+        logger="mcp.tools",
+    )
+
+    start = time.perf_counter()
+    try:
+        entity_mod, _ = _TOOL_REGISTRY[name]
+        result = entity_mod.handle(name, arguments)
+        duration_ms = round((time.perf_counter() - start) * 1000)
+
+        is_error: bool = result.get("isError", False)
+        content = [
+            TextContent(type="text", text=item["text"])
+            for item in result.get("content", [])
+            if item.get("type") == "text"
+        ]
+
+        if is_error:
+            logger.warning(
+                "tools/call tool=%s duration=%dms status=tool_error", name, duration_ms
+            )
+            await session.send_log_message(
+                level="warning",
+                data={"tool": name, "status": "tool_error", "duration_ms": duration_ms},
+                logger="mcp.tools",
+            )
+        else:
+            logger.info("tools/call tool=%s duration=%dms status=ok", name, duration_ms)
+            await session.send_log_message(
+                level="info",
+                data={"tool": name, "status": "ok", "duration_ms": duration_ms},
+                logger="mcp.tools",
+            )
+
+        return CallToolResult(content=content, isError=is_error)
+
+    except Exception as exc:
+        duration_ms = round((time.perf_counter() - start) * 1000)
+        logger.exception("tools/call tool=%s raised unexpected error", name)
+        await session.send_log_message(
+            level="error",
+            data={
+                "tool": name,
+                "status": "error",
+                "error": str(exc),
+                "duration_ms": duration_ms,
             },
-        },
-    ),
-    ToolDefinition(
-        name="lookup_weather",
-        description=(
-            "Retrieves comprehensive weather data including current conditions, "
-            "hourly, and daily forecasts."
-        ),
-        inputSchema={
-            "type": "object",
-            "required": ["location"],
-            "properties": {
-                "location": {
-                    "type": "object",
-                    "description": "Location (one of: latLng, placeId, address).",
-                    "properties": {
-                        "latLng": {
-                            "type": "object",
-                            "properties": {
-                                "latitude": {"type": "number"},
-                                "longitude": {"type": "number"},
-                            },
-                        },
-                        "placeId": {"type": "string"},
-                        "address": {"type": "string"},
-                    },
-                },
-                "unitsSystem": {
-                    "type": "string",
-                    "enum": ["METRIC", "IMPERIAL"],
-                    "description": "Unit system for returned values.",
-                },
-                "date": {
-                    "type": "object",
-                    "description": "Date for forecast (year, month, day).",
-                    "properties": {
-                        "year": {"type": "integer"},
-                        "month": {"type": "integer"},
-                        "day": {"type": "integer"},
-                    },
-                },
-                "hour": {
-                    "type": "integer",
-                    "minimum": 0,
-                    "maximum": 23,
-                    "description": "Hour (0-23) for hourly forecast.",
-                },
-            },
-        },
-    ),
-    ToolDefinition(
-        name="compute_routes",
-        description=(
-            "Computes a travel route between a specified origin and destination. "
-            "Supported travel modes: DRIVE (default), WALK."
-        ),
-        inputSchema={
-            "type": "object",
-            "required": ["origin", "destination"],
-            "properties": {
-                "origin": {
-                    "type": "object",
-                    "description": "Origin waypoint (one of: address, latLng, placeId).",
-                    "properties": {
-                        "address": {"type": "string"},
-                        "latLng": {
-                            "type": "object",
-                            "properties": {
-                                "latitude": {"type": "number"},
-                                "longitude": {"type": "number"},
-                            },
-                        },
-                        "placeId": {"type": "string"},
-                    },
-                },
-                "destination": {
-                    "type": "object",
-                    "description": "Destination waypoint (one of: address, latLng, placeId).",
-                    "properties": {
-                        "address": {"type": "string"},
-                        "latLng": {
-                            "type": "object",
-                            "properties": {
-                                "latitude": {"type": "number"},
-                                "longitude": {"type": "number"},
-                            },
-                        },
-                        "placeId": {"type": "string"},
-                    },
-                },
-                "travelMode": {
-                    "type": "string",
-                    "enum": ["DRIVE", "WALK"],
-                    "description": "Travel mode.",
-                },
-            },
-        },
-    ),
-]
+            logger="mcp.tools",
+        )
+        return CallToolResult(
+            content=[TextContent(type="text", text=f"Internal error: {exc}")],
+            isError=True,
+        )
 
-_TOOL_MAP = {t.name: t for t in _TOOLS}
 
 # ---------------------------------------------------------------------------
-# JSON-RPC helpers
+# Resource handlers
 # ---------------------------------------------------------------------------
 
 
-def _ok(request_id: Any, result: Any) -> JsonRpcResponse:
-    return JsonRpcResponse(id=request_id, result=result)
-
-
-def _err(request_id: Any, code: int, message: str) -> JsonRpcResponse:
-    return JsonRpcResponse(
-        id=request_id, error=JsonRpcError(code=code, message=message)
+@server.list_resources()
+async def list_resources() -> list[Resource]:
+    """Return all concrete (non-template) resources."""
+    return (
+        customers_res.get_resources()
+        + products_res.get_resources()
+        + orders_res.get_resources()
     )
 
 
-# Standard JSON-RPC 2.0 error codes
-_PARSE_ERROR = -32700
-_INVALID_REQUEST = -32600
-_METHOD_NOT_FOUND = -32601
-_INVALID_PARAMS = -32602
-_INTERNAL_ERROR = -32603
-
-# Application-level codes
-_UNAUTHENTICATED = -32000
-
-# ---------------------------------------------------------------------------
-# Handlers
-# ---------------------------------------------------------------------------
+@server.list_resource_templates()
+async def list_resource_templates() -> list[ResourceTemplate]:
+    """Return all URI-template resources."""
+    return (
+        customers_res.get_templates()
+        + products_res.get_templates()
+        + orders_res.get_templates()
+    )
 
 
-def _handle_tools_list() -> dict[str, Any]:
-    return ToolsListResult(tools=_TOOLS).model_dump()
-
-
-def _handle_tools_call(params: dict[str, Any]) -> dict[str, Any]:
-    tool_name: str = params.get("name", "")
-    arguments: dict[str, Any] = params.get("arguments") or {}
-
-    if tool_name not in _TOOL_MAP:
-        raise ValueError(f"Unknown tool: {tool_name}")
-
-    if tool_name == "search_places":
-        req = SearchPlacesRequest(**arguments)
-        content = build_search_places_response(req)
-    elif tool_name == "lookup_weather":
-        req = LookupWeatherRequest(**arguments)
-        content = build_lookup_weather_response(req)
-    elif tool_name == "compute_routes":
-        req = ComputeRoutesRequest(**arguments)
-        content = build_compute_routes_response(req)
-    else:
-        raise ValueError(f"Unhandled tool: {tool_name}")  # pragma: no cover
-
-    return {"content": [{"type": "text", "text": str(content)}], "result": content}
-
-
-# ---------------------------------------------------------------------------
-# Public handler
-# ---------------------------------------------------------------------------
-
-
-def handle_mcp_request(body: bytes, api_key: str | None) -> JsonRpcResponse:
-    """
-    Handle an MCP JSON-RPC 2.0 request.
-
-    Requires a non-empty X-Goog-Api-Key (any value is accepted by this mock).
-
-    :param body: Raw request body bytes.
-    :param api_key: Value of the X-Goog-Api-Key header, or None if absent.
-    :returns: A JsonRpcResponse to serialize back to the caller.
-    """
-    # 1. Validate authentication
-    if not api_key:
-        return _err(None, _UNAUTHENTICATED, "Missing X-Goog-Api-Key header")
-
-    # 2. Parse JSON body
-    try:
-        body_dict = json.loads(body)
-    except Exception:
-        return _err(None, _PARSE_ERROR, "Could not parse JSON body")
-
-    # 3. Validate JSON-RPC envelope
-    try:
-        rpc_req = JsonRpcRequest(**body_dict)
-    except (ValidationError, TypeError) as exc:
-        return _err(None, _INVALID_REQUEST, f"Invalid JSON-RPC request: {exc}")
-
-    # 4. Dispatch
-    try:
-        if rpc_req.method == "tools/list":
-            result = _handle_tools_list()
-        elif rpc_req.method == "tools/call":
-            if not rpc_req.params:
-                return _err(
-                    rpc_req.id, _INVALID_PARAMS, "Missing params for tools/call"
-                )
-            result = _handle_tools_call(rpc_req.params)
-        else:
-            return _err(
-                rpc_req.id, _METHOD_NOT_FOUND, f"Method not found: {rpc_req.method}"
-            )
-    except (ValidationError, TypeError) as exc:
-        return _err(rpc_req.id, _INVALID_PARAMS, f"Invalid parameters: {exc}")
-    except ValueError as exc:
-        return _err(rpc_req.id, _INVALID_PARAMS, str(exc))
-    except Exception as exc:  # noqa: BLE001
-        return _err(rpc_req.id, _INTERNAL_ERROR, f"Internal error: {exc}")
-
-    return _ok(rpc_req.id, result)
+@server.read_resource()
+async def read_resource(uri) -> str:
+    """Route a resource read to the appropriate entity handler."""
+    uri_str = str(uri)
+    if uri_str.startswith("customers://"):
+        return customers_res.read(uri_str)
+    if uri_str.startswith("products://"):
+        return products_res.read(uri_str)
+    if uri_str.startswith("orders://"):
+        return orders_res.read(uri_str)
+    raise ValueError(f"No resource handler for URI: {uri_str}")

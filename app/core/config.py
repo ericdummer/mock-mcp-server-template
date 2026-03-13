@@ -13,6 +13,8 @@ class Settings(BaseSettings):
     debug: bool = False
     host: str = "0.0.0.0"
     port: int = 8000
+    api_key_header: str = "X-Api-Key"
+    log_level: str = "INFO"
 
 
 @lru_cache
